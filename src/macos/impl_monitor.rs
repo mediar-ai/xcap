@@ -1,8 +1,13 @@
+use std::{collections::HashMap, io::Error};
+
 use core_graphics::display::{
     kCGNullWindowID, kCGWindowListOptionAll, CGDirectDisplayID, CGDisplay, CGDisplayMode, CGError,
     CGPoint,
 };
 use image::RgbaImage;
+use objc2::MainThreadMarker;
+use objc2_app_kit::NSScreen;
+use objc2_foundation::{NSNumber, NSString};
 
 use crate::error::{XCapError, XCapResult};
 
@@ -42,10 +47,18 @@ impl ImplMonitor {
         let pixel_width = cg_display_mode.pixel_width();
         let scale_factor = pixel_width as f32 / cg_rect.size.width as f32;
 
+        let screen_name_map = ImplMonitor::screen_map().unwrap_or(HashMap::new());
+
+        let screen_id = cg_display.id;
+        let default_name = format!("Monitor #{screen_num}");
+
         Ok(ImplMonitor {
             cg_display,
             id: cg_display.id,
-            name: format!("Monitor #{screen_num}"),
+            name: screen_name_map
+                .get(&screen_id)
+                .unwrap_or(&default_name)
+                .clone(),
             x: cg_rect.origin.x as i32,
             y: cg_rect.origin.y as i32,
             width: cg_rect.size.width as u32,
@@ -114,6 +127,26 @@ impl ImplMonitor {
             Ok(impl_monitor)
         }
     }
+
+    pub fn screen_map() -> Result<HashMap<u32, String>, Error> {
+        let mut screen_name_map: HashMap<u32, String> = HashMap::new();
+        let thread = MainThreadMarker::new();
+        let screens = NSScreen::screens(thread.unwrap()).to_vec();
+        for screen in screens {
+            unsafe {
+                let screen_name = screen.localizedName();
+                let description = screen
+                    .deviceDescription()
+                    .objectForKey(&NSString::from_str("NSScreenNumber"));
+                if let Some(description) = description {
+                    let display_id = description.downcast::<NSNumber>().unwrap();
+                    screen_name_map.insert(display_id.as_u32(), screen_name.to_string());
+                }
+            }
+        }
+        Ok(screen_name_map)
+    }
+
 }
 
 fn get_cg_display_mode(cg_display: CGDisplay) -> XCapResult<CGDisplayMode> {
