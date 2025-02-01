@@ -1,3 +1,4 @@
+mod camera;
 mod error;
 mod monitor;
 mod video_recorder;
@@ -17,8 +18,8 @@ mod platform;
 
 pub use image;
 
+pub use camera::Camera;
 pub use error::{XCapError, XCapResult};
 pub use monitor::Monitor;
-pub use window::Window;
-
 pub use video_recorder::VideoRecorder;
+pub use window::Window;
