@@ -17,12 +17,15 @@ vendored = ["dbus/vendored"]
 [dependencies]
 image = "0.25"
 log = "0.4"
+objc2 = "0.6.0"
+objc2-foundation = "0.3.0"
 sysinfo = "0.33"
 thiserror = "2.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-graphics = "0.24"
+objc2-av-foundation = {"version" = "0.3.0", features = ["AVCaptureDevice"]}
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
