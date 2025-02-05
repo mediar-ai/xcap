@@ -1,10 +1,12 @@
 use core::slice;
-use image::RgbaImage;
 use std::{cmp::Ordering, ffi::c_void, mem, ptr};
+
+use image::RgbaImage;
+use widestring::U16CString;
 use windows::{
     core::{HSTRING, PCWSTR},
     Win32::{
-        Foundation::{BOOL, HWND, LPARAM, MAX_PATH, RECT, TRUE},
+        Foundation::{BOOL, HANDLE, HWND, LPARAM, MAX_PATH, RECT, TRUE},
         Graphics::{
             Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS},
             Gdi::{IsRectEmpty, MonitorFromWindow, MONITOR_DEFAULTTONEAREST},
@@ -12,22 +14,25 @@ use windows::{
         Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
         System::{
             ProcessStatus::{GetModuleBaseNameW, GetModuleFileNameExW},
-            Threading::{GetCurrentProcessId, PROCESS_ALL_ACCESS},
+            Threading::{
+                GetCurrentProcess, GetCurrentProcessId, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
         },
         UI::WindowsAndMessaging::{
-            EnumWindows, GetClassNameW, GetWindowInfo, GetWindowLongPtrW, GetWindowTextLengthW,
-            GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-            IsZoomed, GWL_EXSTYLE, WINDOWINFO, WINDOW_EX_STYLE, WS_EX_TOOLWINDOW,
+            EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowInfo, GetWindowLongPtrW,
+            GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+            IsWindowVisible, IsZoomed, GWL_EXSTYLE, WINDOWINFO, WINDOW_EX_STYLE, WS_EX_TOOLWINDOW,
         },
     },
 };
 
-use crate::{
-    error::XCapResult,
-    platform::{boxed::BoxProcessHandle, utils::log_last_error},
-};
+use crate::{error::XCapResult, platform::utils::log_last_error};
 
-use super::{capture::capture_window, impl_monitor::ImplMonitor, utils::wide_string_to_string};
+use super::{
+    capture::capture_window,
+    impl_monitor::ImplMonitor,
+    utils::{get_process_is_dpi_awareness, open_process},
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ImplWindow {
@@ -37,10 +42,11 @@ pub(crate) struct ImplWindow {
     pub id: u32,
     pub title: String,
     pub app_name: String,
-    pub process_id: u32,
+    pub pid: u32,
     pub current_monitor: ImplMonitor,
     pub x: i32,
     pub y: i32,
+    pub z: i32,
     pub width: u32,
     pub height: u32,
     pub is_minimized: bool,
@@ -72,7 +78,7 @@ fn is_window_cloaked(hwnd: HWND) -> bool {
 fn is_valid_window(hwnd: HWND) -> bool {
     unsafe {
         // ignore invisible windows
-        if !IsWindow(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+        if !IsWindow(Some(hwnd)).as_bool() || !IsWindowVisible(hwnd).as_bool() {
             return false;
         }
 
@@ -89,8 +95,9 @@ fn is_valid_window(hwnd: HWND) -> bool {
             return false;
         }
 
-        let class_name =
-            wide_string_to_string(&lp_class_name[0..lp_class_name_length]).unwrap_or_default();
+        let class_name = U16CString::from_vec_truncate(&lp_class_name[0..lp_class_name_length])
+            .to_string()
+            .unwrap_or_default();
         if class_name.is_empty() {
             return false;
         }
@@ -117,7 +124,7 @@ fn is_valid_window(hwnd: HWND) -> bool {
         // windows owned by the current process. Consumers should either ensure that
         // the thread running their message loop never waits on this operation, or use
         // the option to exclude these windows from the source list.
-        let lp_dw_process_id = get_process_id(hwnd);
+        let lp_dw_process_id = get_window_pid(hwnd);
         if lp_dw_process_id == GetCurrentProcessId() {
             return false;
         }
@@ -160,12 +167,13 @@ fn is_valid_window(hwnd: HWND) -> bool {
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, state: LPARAM) -> BOOL {
-    if !is_valid_window(hwnd) {
-        return TRUE;
+    let state = Box::leak(Box::from_raw(state.0 as *mut (Vec<(HWND, i32)>, i32)));
+
+    if is_valid_window(hwnd) {
+        state.0.push((hwnd, state.1));
     }
 
-    let state = Box::leak(Box::from_raw(state.0 as *mut Vec<HWND>));
-    state.push(hwnd);
+    state.1 += 1;
 
     TRUE
 }
@@ -175,7 +183,9 @@ fn get_window_title(hwnd: HWND) -> XCapResult<String> {
         let text_length = GetWindowTextLengthW(hwnd);
         let mut wide_buffer = vec![0u16; (text_length + 1) as usize];
         GetWindowTextW(hwnd, &mut wide_buffer);
-        wide_string_to_string(&wide_buffer)
+        let window_title = U16CString::from_vec_truncate(wide_buffer).to_string()?;
+
+        Ok(window_title)
     }
 }
 
@@ -185,23 +195,25 @@ struct LangCodePage {
     pub w_code_page: u16,
 }
 
-fn get_module_basename(box_process_handle: BoxProcessHandle) -> XCapResult<String> {
+fn get_module_basename(handle: HANDLE) -> XCapResult<String> {
     unsafe {
         // 默认使用 module_basename
         let mut module_base_name_w = [0; MAX_PATH as usize];
-        let result = GetModuleBaseNameW(*box_process_handle, None, &mut module_base_name_w);
+        let result = GetModuleBaseNameW(handle, None, &mut module_base_name_w);
 
         if result == 0 {
             log_last_error("GetModuleBaseNameW");
 
-            GetModuleFileNameExW(*box_process_handle, None, &mut module_base_name_w);
+            GetModuleFileNameExW(Some(handle), None, &mut module_base_name_w);
         }
 
-        wide_string_to_string(&module_base_name_w)
+        let module_basename = U16CString::from_vec_truncate(module_base_name_w).to_string()?;
+
+        Ok(module_basename)
     }
 }
 
-fn get_process_id(hwnd: HWND) -> u32 {
+fn get_window_pid(hwnd: HWND) -> u32 {
     unsafe {
         let mut lp_dw_process_id = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut lp_dw_process_id));
@@ -209,21 +221,18 @@ fn get_process_id(hwnd: HWND) -> u32 {
     }
 }
 
-fn get_app_name(hwnd: HWND) -> XCapResult<String> {
+fn get_app_name(pid: u32) -> XCapResult<String> {
     unsafe {
-        let lp_dw_process_id = get_process_id(hwnd);
-
-        let box_process_handle =
-            match BoxProcessHandle::open(PROCESS_ALL_ACCESS, false, lp_dw_process_id) {
-                Ok(box_handle) => box_handle,
-                Err(err) => {
-                    log::error!("{}", err);
-                    return Ok(String::new());
-                }
-            };
+        let scope_guard_handle = match open_process(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(box_handle) => box_handle,
+            Err(err) => {
+                log::error!("{}", err);
+                return Ok(String::new());
+            }
+        };
 
         let mut filename = [0; MAX_PATH as usize];
-        GetModuleFileNameExW(*box_process_handle, None, &mut filename);
+        GetModuleFileNameExW(Some(*scope_guard_handle), None, &mut filename);
 
         let pcw_filename = PCWSTR::from_raw(filename.as_ptr());
 
@@ -231,14 +240,14 @@ fn get_app_name(hwnd: HWND) -> XCapResult<String> {
         if file_version_info_size_w == 0 {
             log_last_error("GetFileVersionInfoSizeW");
 
-            return get_module_basename(box_process_handle);
+            return get_module_basename(*scope_guard_handle);
         }
 
         let mut file_version_info = vec![0u16; file_version_info_size_w as usize];
 
         GetFileVersionInfoW(
             pcw_filename,
-            0,
+            None,
             file_version_info_size_w,
             file_version_info.as_mut_ptr().cast(),
         )?;
@@ -290,7 +299,7 @@ fn get_app_name(hwnd: HWND) -> XCapResult<String> {
                 }
 
                 let value = slice::from_raw_parts(value_ptr.cast(), value_length as usize);
-                let attr = wide_string_to_string(value)?;
+                let attr = U16CString::from_vec_truncate(value).to_string()?;
                 let attr = attr.trim();
 
                 if !attr.is_empty() {
@@ -299,16 +308,12 @@ fn get_app_name(hwnd: HWND) -> XCapResult<String> {
             }
         }
 
-        get_module_basename(box_process_handle)
+        get_module_basename(*scope_guard_handle)
     }
 }
 
-fn is_window_focused(hwnd: HWND) -> bool {
-    unsafe { GetForegroundWindow() == hwnd }
-}
-
 impl ImplWindow {
-    fn new(hwnd: HWND) -> XCapResult<ImplWindow> {
+    fn new(hwnd: HWND, z: i32) -> XCapResult<ImplWindow> {
         unsafe {
             let mut window_info = WINDOWINFO {
                 cbSize: mem::size_of::<WINDOWINFO>() as u32,
@@ -318,13 +323,14 @@ impl ImplWindow {
             GetWindowInfo(hwnd, &mut window_info)?;
 
             let title = get_window_title(hwnd)?;
-            let app_name = get_app_name(hwnd)?;
+            let pid = get_window_pid(hwnd);
+            let app_name = get_app_name(pid)?;
 
-            let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let h_monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
             let rc_client = window_info.rcClient;
             let is_minimized = IsIconic(hwnd).as_bool();
             let is_maximized = IsZoomed(hwnd).as_bool();
-            let is_focused = is_window_focused(hwnd);
+            let is_focused = GetForegroundWindow() == hwnd;
 
             Ok(ImplWindow {
                 hwnd,
@@ -332,10 +338,11 @@ impl ImplWindow {
                 id: hwnd.0 as u32,
                 title,
                 app_name,
-                process_id: get_process_id(hwnd),
-                current_monitor: ImplMonitor::new(hmonitor)?,
+                pid,
+                current_monitor: ImplMonitor::new(h_monitor)?,
                 x: rc_client.left,
                 y: rc_client.top,
+                z,
                 width: (rc_client.right - rc_client.left) as u32,
                 height: (rc_client.bottom - rc_client.top) as u32,
                 is_minimized,
@@ -346,17 +353,22 @@ impl ImplWindow {
     }
 
     pub fn all() -> XCapResult<Vec<ImplWindow>> {
-        let hwnds_mut_ptr: *mut Vec<HWND> = Box::into_raw(Box::default());
+        // (HWND, i32) 表示当前窗口以及层级，既（窗口，层级 z），i32 表示 max_z_order，既最大的窗口的 z 顺序
+        // 窗口当前层级为 max_z_order - z
+        let hwnds_mut_ptr: *mut (Vec<(HWND, i32)>, i32) = Box::into_raw(Box::default());
 
         let hwnds = unsafe {
+            // EnumWindows 函数按照 Z 顺序遍历顶层窗口，从最顶层的窗口开始，依次向下遍历。
             EnumWindows(Some(enum_windows_proc), LPARAM(hwnds_mut_ptr as isize))?;
             Box::from_raw(hwnds_mut_ptr)
         };
 
         let mut impl_windows = Vec::new();
 
-        for &hwnd in hwnds.iter() {
-            if let Ok(impl_window) = ImplWindow::new(hwnd) {
+        let max_z_order = hwnds.1;
+
+        for &(hwnd, z) in hwnds.0.iter() {
+            if let Ok(impl_window) = ImplWindow::new(hwnd, max_z_order - z) {
                 impl_windows.push(impl_window);
             } else {
                 log::error!("ImplWindow::new({:?}) failed", hwnd);
@@ -368,33 +380,22 @@ impl ImplWindow {
 }
 
 impl ImplWindow {
-    pub fn refresh(&mut self) -> XCapResult<()> {
-        let impl_window = ImplWindow::new(self.hwnd)?;
-
-        self.hwnd = impl_window.hwnd;
-        self.window_info = impl_window.window_info;
-        self.id = impl_window.id;
-        self.title = impl_window.title;
-        self.app_name = impl_window.app_name;
-        self.process_id = impl_window.process_id;
-        self.current_monitor = impl_window.current_monitor;
-        self.x = impl_window.x;
-        self.y = impl_window.y;
-        self.width = impl_window.width;
-        self.height = impl_window.height;
-        self.is_minimized = impl_window.is_minimized;
-        self.is_maximized = impl_window.is_maximized;
-        self.is_focused = is_window_focused(self.hwnd);
-
-        Ok(())
-    }
-
     pub fn capture_image(&self) -> XCapResult<RgbaImage> {
-        // TODO: 在win10之后，不同窗口有不同的dpi，所以可能存在截图不全或者截图有较大空白，实际窗口没有填充满图片
-        capture_window(
-            self.hwnd,
-            self.current_monitor.scale_factor,
-            &self.window_info,
-        )
+        // 在win10之后，不同窗口有不同的dpi，所以可能存在截图不全或者截图有较大空白，实际窗口没有填充满图片
+        // 如果窗口不感知dpi，那么就不需要缩放，如果当前进程感知dpi，那么也不需要缩放
+        let scope_guard_handle = open_process(PROCESS_QUERY_LIMITED_INFORMATION, false, self.pid)?;
+        let window_is_dpi_awareness = get_process_is_dpi_awareness(*scope_guard_handle)?;
+        let current_process_is_dpi_awareness =
+            unsafe { get_process_is_dpi_awareness(GetCurrentProcess())? };
+
+        let scale_factor = if !window_is_dpi_awareness {
+            1.0
+        } else if current_process_is_dpi_awareness {
+            1.0
+        } else {
+            self.current_monitor.scale_factor
+        };
+
+        capture_window(self.hwnd, scale_factor, &self.window_info)
     }
 }

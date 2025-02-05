@@ -3,8 +3,8 @@ use std::str;
 use xcb::{
     x::{
         Atom, Drawable, GetGeometry, GetProperty, GetPropertyReply, InternAtom, QueryPointer,
-        TranslateCoordinates, Window, ATOM_ATOM, ATOM_NONE, ATOM_STRING, ATOM_WM_CLASS,
-        ATOM_WM_NAME, ATOM_WINDOW,
+        TranslateCoordinates, Window, ATOM_ATOM, ATOM_CARDINAL, ATOM_NONE, ATOM_STRING,
+        ATOM_WM_CLASS, ATOM_WM_NAME,
     },
     Connection, Xid,
 };
@@ -19,9 +19,11 @@ pub(crate) struct ImplWindow {
     pub id: u32,
     pub title: String,
     pub app_name: String,
+    pub pid: u32,
     pub current_monitor: ImplMonitor,
     pub x: i32,
     pub y: i32,
+    pub z: i32,
     pub width: u32,
     pub height: u32,
     pub is_minimized: bool,
@@ -37,7 +39,7 @@ fn get_atom(conn: &Connection, name: &str) -> XCapResult<Atom> {
     let atom_reply = conn.wait_for_reply(atom_cookie)?;
     let atom = atom_reply.atom();
 
-    if atom == ATOM_NONE {
+    if atom.is_none() {
         return Err(XCapError::new(format!("{} not supported", name)));
     }
 
@@ -68,28 +70,52 @@ fn get_window_property(
 
 fn get_focused_window(conn: &Connection, root_window: Window) -> XCapResult<Window> {
     let active_window_atom = get_atom(conn, "_NET_ACTIVE_WINDOW")?;
-    
-    let active_window_reply = get_window_property(
-        conn,
-        root_window,
-        active_window_atom,
-        ATOM_WINDOW,
-        0,
-        1,
-    )?;
 
-    let active_window = active_window_reply.value::<Window>()
+    let active_window_reply =
+        get_window_property(conn, root_window, active_window_atom, ATOM_WINDOW, 0, 1)?;
+    let active_window = active_window_reply
+        .value::<Window>()
         .first()
         .copied()
         .unwrap_or(Window::none());
-
     Ok(active_window)
+}
+
+pub fn get_window_pid(conn: &Connection, window: &Window) -> XCapResult<u32> {
+    let wm_pid_atom = get_atom(conn, "_NET_WM_PID")?;
+
+    let reply = get_window_property(conn, *window, wm_pid_atom, ATOM_CARDINAL, 0, 4)?;
+    let value = reply.value::<u32>();
+
+    value
+        .first()
+        .ok_or(XCapError::new("Get window pid failed"))
+        .copied()
+}
+
+fn get_active_window_id(conn: &Connection) -> Option<u32> {
+    let active_window_atom = get_atom(conn, "_NET_ACTIVE_WINDOW").ok()?;
+    let setup = conn.get_setup();
+
+    for screen in setup.roots() {
+        let root_window = screen.root();
+        let active_window_id =
+            get_window_property(conn, root_window, active_window_atom, ATOM_NONE, 0, 4).ok()?;
+        if let Some(&active_window_id) = active_window_id.value::<u32>().first() {
+            return Some(active_window_id);
+        }
+    }
+
+    None
 }
 
 impl ImplWindow {
     fn new(
         conn: &Connection,
         window: &Window,
+        pid: u32,
+        z: i32,
+        is_focused: bool,
         impl_monitors: &Vec<ImplMonitor>,
     ) -> XCapResult<ImplWindow> {
         let title = {
@@ -190,7 +216,10 @@ impl ImplWindow {
 
         let is_focused = {
             let setup = conn.get_setup();
-            let screen = setup.roots().next().ok_or(XCapError::new("No screen found"))?;
+            let screen = setup
+                .roots()
+                .next()
+                .ok_or(XCapError::new("No screen found"))?;
             let focused_window = get_focused_window(conn, screen.root())?;
             focused_window == *window
         };
@@ -200,9 +229,11 @@ impl ImplWindow {
             id: window.resource_id(),
             title,
             app_name,
+            pid,
             current_monitor,
             x,
             y,
+            z,
             width,
             height,
             is_minimized,
@@ -216,11 +247,15 @@ impl ImplWindow {
         let setup = conn.get_setup();
 
         // https://github.com/rust-x-bindings/rust-xcb/blob/main/examples/get_all_windows.rs
-        let client_list_atom = get_atom(&conn, "_NET_CLIENT_LIST")?;
+        // https://specifications.freedesktop.org/wm-spec/1.5/ar01s03.html#id-1.4.4
+        // list all windows by stacking order
+        let client_list_atom = get_atom(&conn, "_NET_CLIENT_LIST_STACKING")?;
+        let active_window_id = get_active_window_id(&conn);
 
         let mut impl_windows = Vec::new();
         let impl_monitors = ImplMonitor::all()?;
 
+        let mut z = -1;
         for screen in setup.roots() {
             let root_window = screen.root();
 
@@ -239,14 +274,35 @@ impl ImplWindow {
                     client_list_atom,
                     ATOM_NONE,
                     0,
-                    100,
+                    1024,
                 ) {
                     Ok(list_window_reply) => list_window_reply,
                     _ => continue,
                 };
 
                 for client in list_window_reply.value::<Window>() {
-                    if let Ok(impl_window) = ImplWindow::new(&conn, client, &impl_monitors) {
+                    z += 1;
+                    let pid = match get_window_pid(&conn, client) {
+                        Ok(pid) => pid,
+                        err => {
+                            log::error!("{:?}", err);
+                            continue;
+                        }
+                    };
+
+                    let is_focused = {
+                        let setup = conn.get_setup();
+                        let screen = setup
+                            .roots()
+                            .next()
+                            .ok_or(XCapError::new("No screen found"))?;
+                        let focused_window = get_focused_window(conn, screen.root())?;
+                        focused_window == *window
+                    };
+
+                    if let Ok(impl_window) =
+                        ImplWindow::new(&conn, client, pid, z, is_focused, &impl_monitors)
+                    {
                         impl_windows.push(impl_window);
                     } else {
                         log::error!(
@@ -259,31 +315,13 @@ impl ImplWindow {
             }
         }
 
+        impl_windows.reverse();
+
         Ok(impl_windows)
     }
 }
 
 impl ImplWindow {
-    pub fn refresh(&mut self) -> XCapResult<()> {
-        let (conn, _) = Connection::connect(None)?;
-        let impl_monitors = ImplMonitor::all()?;
-        let impl_window = ImplWindow::new(&conn, &self.window, &impl_monitors)?;
-
-        self.window = impl_window.window;
-        self.id = impl_window.id;
-        self.title = impl_window.title;
-        self.app_name = impl_window.app_name;
-        self.current_monitor = impl_window.current_monitor;
-        self.x = impl_window.x;
-        self.y = impl_window.y;
-        self.width = impl_window.width;
-        self.height = impl_window.height;
-        self.is_minimized = impl_window.is_minimized;
-        self.is_maximized = impl_window.is_maximized;
-        self.is_focused = impl_window.is_focused;
-
-        Ok(())
-    }
     pub fn capture_image(&self) -> XCapResult<RgbaImage> {
         capture_window(self)
     }

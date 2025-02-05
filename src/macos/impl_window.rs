@@ -1,33 +1,31 @@
-use core_foundation::{
-    array::{CFArrayGetCount, CFArrayGetValueAtIndex},
-    base::{FromVoid, TCFType},
-    dictionary::{CFDictionaryGetValue, CFDictionaryRef},
-    number::{kCFNumberIntType, CFBooleanGetValue, CFBooleanRef, CFNumberGetValue, CFNumberRef},
-    string::CFString,
-};
-use core_graphics::{
-    display::{
-        kCGWindowListExcludeDesktopElements, kCGWindowListOptionIncludingWindow,
-        kCGWindowListOptionOnScreenOnly, CGDisplay, CGPoint, CGSize, CGWindowListCopyWindowInfo,
-    },
-    geometry::CGRect,
-    window::{kCGNullWindowID, kCGWindowSharingNone},
-};
-use image::RgbaImage;
 use std::ffi::c_void;
+
+use image::RgbaImage;
+use objc2_core_foundation::{
+    CFArrayGetCount, CFArrayGetValueAtIndex, CFBoolean, CFBooleanGetValue, CFDictionary,
+    CFDictionaryGetValue, CFNumber, CFNumberGetValue, CFNumberType, CFString, CGPoint, CGRect,
+    CGSize,
+};
+use objc2_core_graphics::{
+    CGDisplayBounds, CGEventCreate, CGEventGetUnflippedLocation, CGEventSourceCreate,
+    CGEventSourceStateID, CGMainDisplayID, CGRectContainsPoint, CGRectIntersectsRect,
+    CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo, CGWindowListOption,
+};
 
 use crate::{error::XCapResult, XCapError};
 
-use super::{boxed::BoxCFArrayRef, capture::capture, impl_monitor::ImplMonitor};
+use super::{capture::capture, impl_monitor::ImplMonitor};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ImplWindow {
     pub id: u32,
     pub title: String,
     pub app_name: String,
+    pub pid: u32,
     pub current_monitor: ImplMonitor,
     pub x: i32,
     pub y: i32,
+    pub z: i32,
     pub width: u32,
     pub height: u32,
     pub is_minimized: bool,
@@ -37,26 +35,15 @@ pub(crate) struct ImplWindow {
 
 unsafe impl Send for ImplWindow {}
 
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGRectMakeWithDictionaryRepresentation(
-        dict: CFDictionaryRef,
-        rect: &mut CGRect,
-    ) -> CFBooleanRef;
-    fn CGEventSourceCreate(stateID: i32) -> *mut c_void;
-    fn CGEventGetUnflippedLocation(event: *mut c_void) -> CGPoint;
-    fn CGEventCreate(source: *mut c_void) -> *mut c_void;
-    fn CFRelease(cf: *mut c_void);
-}
-
 fn get_cf_dictionary_get_value(
-    cf_dictionary_ref: CFDictionaryRef,
+    cf_dictionary: &CFDictionary,
     key: &str,
 ) -> XCapResult<*const c_void> {
     unsafe {
-        let cf_dictionary_key = CFString::new(key);
+        let cf_dictionary_key = CFString::from_str(key);
+        let cf_dictionary_key_ref = cf_dictionary_key.as_ref() as *const CFString;
 
-        let value = CFDictionaryGetValue(cf_dictionary_ref, cf_dictionary_key.as_CFTypeRef());
+        let value = CFDictionaryGetValue(cf_dictionary, cf_dictionary_key_ref.cast());
 
         if value.is_null() {
             return Err(XCapError::new(format!(
@@ -69,48 +56,14 @@ fn get_cf_dictionary_get_value(
     }
 }
 
-fn get_cf_number_u32_value(cf_dictionary_ref: CFDictionaryRef, key: &str) -> XCapResult<u32> {
+fn get_cf_number_i32_value(cf_dictionary: &CFDictionary, key: &str) -> XCapResult<i32> {
     unsafe {
-        let cf_number_ref = get_cf_dictionary_get_value(cf_dictionary_ref, key)?;
-
-        let mut value: u32 = 0;
-        let is_success = CFNumberGetValue(
-            cf_number_ref as CFNumberRef,
-            kCFNumberIntType,
-            &mut value as *mut _ as *mut c_void,
-        );
-
-        if !is_success {
-            return Err(XCapError::new(format!(
-                "Get {} CFNumberGetValue failed",
-                key
-            )));
-        }
-
-        Ok(value)
-    }
-}
-
-fn get_cf_string_value(cf_dictionary_ref: CFDictionaryRef, key: &str) -> XCapResult<String> {
-    let value_ref = get_cf_dictionary_get_value(cf_dictionary_ref, key)?;
-
-    Ok(unsafe { CFString::from_void(value_ref).to_string() })
-}
-
-fn get_cf_bool_value(cf_dictionary_ref: CFDictionaryRef, key: &str) -> XCapResult<bool> {
-    let value_ref = get_cf_dictionary_get_value(cf_dictionary_ref, key)?;
-
-    Ok(unsafe { CFBooleanGetValue(value_ref as CFBooleanRef) })
-}
-
-fn get_cf_number_i32_value(cf_dictionary_ref: CFDictionaryRef, key: &str) -> XCapResult<i32> {
-    unsafe {
-        let cf_number_ref = get_cf_dictionary_get_value(cf_dictionary_ref, key)?;
+        let cf_number = get_cf_dictionary_get_value(cf_dictionary, key)? as *const CFNumber;
 
         let mut value: i32 = 0;
         let is_success = CFNumberGetValue(
-            cf_number_ref as CFNumberRef,
-            kCFNumberIntType,
+            &*cf_number,
+            CFNumberType::IntType,
             &mut value as *mut _ as *mut c_void,
         );
 
@@ -125,18 +78,40 @@ fn get_cf_number_i32_value(cf_dictionary_ref: CFDictionaryRef, key: &str) -> XCa
     }
 }
 
-fn get_window_cg_rect(window_cf_dictionary_ref: CFDictionaryRef) -> XCapResult<CGRect> {
+fn get_mouse_position() -> CGPoint {
     unsafe {
-        let window_bounds_ref =
-            get_cf_dictionary_get_value(window_cf_dictionary_ref, "kCGWindowBounds")?
-                as CFDictionaryRef;
+        // HIDSystemState = 1
+        let source = CGEventSourceCreate(CGEventSourceStateID::HIDSystemState);
+        let event = CGEventCreate(source.as_deref());
+        let position = CGEventGetUnflippedLocation(event.as_deref());
+
+        position
+    }
+}
+
+fn get_cf_string_value(cf_dictionary: &CFDictionary, key: &str) -> XCapResult<String> {
+    let value_ref = get_cf_dictionary_get_value(cf_dictionary, key)? as *const CFString;
+    let value = unsafe { (*value_ref).to_string() };
+    Ok(value)
+}
+
+fn get_cf_bool_value(cf_dictionary: &CFDictionary, key: &str) -> XCapResult<bool> {
+    let value_ref = get_cf_dictionary_get_value(cf_dictionary, key)? as *const CFBoolean;
+
+    Ok(unsafe { CFBooleanGetValue(&*value_ref) })
+}
+
+fn get_window_cg_rect(window_cf_dictionary: &CFDictionary) -> XCapResult<CGRect> {
+    unsafe {
+        let window_bounds = get_cf_dictionary_get_value(window_cf_dictionary, "kCGWindowBounds")?
+            as *const CFDictionary;
 
         let mut cg_rect = CGRect::default();
 
-        let is_success_ref =
-            CGRectMakeWithDictionaryRepresentation(window_bounds_ref, &mut cg_rect);
+        let is_success =
+            CGRectMakeWithDictionaryRepresentation(Some(&*window_bounds), &mut cg_rect);
 
-        if is_success_ref.is_null() {
+        if !is_success {
             return Err(XCapError::new(
                 "CGRectMakeWithDictionaryRepresentation failed",
             ));
@@ -146,29 +121,20 @@ fn get_window_cg_rect(window_cf_dictionary_ref: CFDictionaryRef) -> XCapResult<C
     }
 }
 
-fn get_mouse_position() -> CGPoint {
-    unsafe {
-        // HIDSystemState = 1
-        let source = CGEventSourceCreate(1);
-        let event = CGEventCreate(source);
-        let position = CGEventGetUnflippedLocation(event);
-        CFRelease(event);
-        CFRelease(source);
-        position
-    }
-}
-
 impl ImplWindow {
     pub fn new(
-        window_cf_dictionary_ref: CFDictionaryRef,
+        window_cf_dictionary: &CFDictionary,
         impl_monitors: &[ImplMonitor],
         window_name: String,
         window_owner_name: String,
+        z: i32,
     ) -> XCapResult<ImplWindow> {
-        let id = get_cf_number_u32_value(window_cf_dictionary_ref, "kCGWindowNumber")?;
-        let cg_rect = get_window_cg_rect(window_cf_dictionary_ref)?;
+        let id = get_cf_number_i32_value(window_cf_dictionary, "kCGWindowNumber")? as u32;
+        let pid = get_cf_number_i32_value(window_cf_dictionary, "kCGWindowOwnerPID")?;
 
-        let primary_monitor = ImplMonitor::new(CGDisplay::main().id)?;
+        let cg_rect = get_window_cg_rect(window_cf_dictionary)?;
+
+        let primary_monitor = ImplMonitor::new(unsafe { CGMainDisplayID() })?;
 
         let (is_maximized, current_monitor) = {
             // 获取窗口中心点的坐标
@@ -181,9 +147,10 @@ impl ImplWindow {
 
             let impl_monitor = impl_monitors
                 .iter()
-                .find(|impl_monitor| {
-                    let display_bounds = impl_monitor.cg_display.bounds();
-                    display_bounds.contains(&cg_point) || display_bounds.is_intersects(&cg_rect)
+                .find(|impl_monitor| unsafe {
+                    let display_bounds = CGDisplayBounds(impl_monitor.cg_direct_display_id);
+                    CGRectContainsPoint(display_bounds, cg_point)
+                        || CGRectIntersectsRect(display_bounds, cg_rect)
                 })
                 .unwrap_or(&primary_monitor);
 
@@ -195,20 +162,19 @@ impl ImplWindow {
         };
 
         let is_minimized =
-            !get_cf_bool_value(window_cf_dictionary_ref, "kCGWindowIsOnscreen")? && !is_maximized;
+            !get_cf_bool_value(window_cf_dictionary, "kCGWindowIsOnscreen")? && !is_maximized;
 
-        let is_focused = {
-            let mouse_pos = get_mouse_position();
-            cg_rect.contains(&mouse_pos)
-        };
+        let is_focused = unsafe { CGRectContainsPoint(cg_rect, get_mouse_position()) };
 
         Ok(ImplWindow {
             id,
             title: window_name,
             app_name: window_owner_name,
+            pid: pid as u32,
             current_monitor: current_monitor.clone(),
             x: cg_rect.origin.x as i32,
             y: cg_rect.origin.y as i32,
+            z,
             width: cg_rect.size.width as u32,
             height: cg_rect.size.height as u32,
             is_minimized,
@@ -220,35 +186,38 @@ impl ImplWindow {
     pub fn all() -> XCapResult<Vec<ImplWindow>> {
         unsafe {
             let impl_monitors = ImplMonitor::all()?;
+
             let mut impl_windows = Vec::new();
 
-            let box_cf_array_ref = BoxCFArrayRef::new(CGWindowListCopyWindowInfo(
-                kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-                kCGNullWindowID,
-            ));
+            // CGWindowListCopyWindowInfo 返回窗口顺序为从顶层到最底层
+            // 即在前面的窗口在数组前面
+            let cf_array = match CGWindowListCopyWindowInfo(
+                CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+                0,
+            ) {
+                Some(cf_array) => cf_array,
+                None => return Ok(impl_windows),
+            };
 
-            if box_cf_array_ref.is_null() {
-                return Ok(impl_windows);
-            }
-
-            let num_windows = CFArrayGetCount(*box_cf_array_ref);
+            let num_windows = CFArrayGetCount(&cf_array);
 
             for i in 0..num_windows {
                 let window_cf_dictionary_ref =
-                    CFArrayGetValueAtIndex(*box_cf_array_ref, i) as CFDictionaryRef;
+                    CFArrayGetValueAtIndex(&cf_array, i) as *const CFDictionary;
 
                 if window_cf_dictionary_ref.is_null() {
                     continue;
                 }
 
-                let window_name =
-                    match get_cf_string_value(window_cf_dictionary_ref, "kCGWindowName") {
-                        Ok(window_name) => window_name,
-                        _ => continue,
-                    };
+                let window_cf_dictionary = &*window_cf_dictionary_ref;
+
+                let window_name = match get_cf_string_value(window_cf_dictionary, "kCGWindowName") {
+                    Ok(window_name) => window_name,
+                    _ => continue,
+                };
 
                 let window_owner_name =
-                    match get_cf_string_value(window_cf_dictionary_ref, "kCGWindowOwnerName") {
+                    match get_cf_string_value(window_cf_dictionary, "kCGWindowOwnerName") {
                         Ok(window_owner_name) => window_owner_name,
                         _ => continue,
                     };
@@ -257,29 +226,28 @@ impl ImplWindow {
                     continue;
                 }
 
-                let window_sharing_state = match get_cf_number_u32_value(
-                    window_cf_dictionary_ref,
-                    "kCGWindowSharingState",
-                ) {
-                    Ok(window_sharing_state) => window_sharing_state,
-                    _ => continue,
-                };
+                let window_sharing_state =
+                    match get_cf_number_i32_value(window_cf_dictionary, "kCGWindowSharingState") {
+                        Ok(window_sharing_state) => window_sharing_state as u32,
+                        _ => continue,
+                    };
 
-                if window_sharing_state == kCGWindowSharingNone {
+                if window_sharing_state == 0 {
                     continue;
                 }
 
                 if let Ok(impl_window) = ImplWindow::new(
-                    window_cf_dictionary_ref,
+                    window_cf_dictionary,
                     &impl_monitors,
                     window_name.clone(),
                     window_owner_name.clone(),
+                    num_windows as i32 - i as i32 - 1,
                 ) {
                     impl_windows.push(impl_window);
                 } else {
                     log::error!(
                         "ImplWindow::new({:?}, {:?}, {:?}, {:?}) failed",
-                        window_cf_dictionary_ref,
+                        window_cf_dictionary,
                         &impl_monitors,
                         &window_name,
                         &window_owner_name
@@ -293,78 +261,13 @@ impl ImplWindow {
 }
 
 impl ImplWindow {
-    pub fn refresh(&mut self) -> XCapResult<()> {
-        unsafe {
-            let impl_monitors = ImplMonitor::all()?;
-
-            let box_cf_array_ref = BoxCFArrayRef::new(CGWindowListCopyWindowInfo(
-                kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-                kCGNullWindowID,
-            ));
-
-            if box_cf_array_ref.is_null() {
-                return Err(XCapError::new("Run CGWindowListCopyWindowInfo error"));
-            }
-
-            let num_windows = CFArrayGetCount(*box_cf_array_ref);
-
-            for i in 0..num_windows {
-                let window_cf_dictionary_ref =
-                    CFArrayGetValueAtIndex(*box_cf_array_ref, i) as CFDictionaryRef;
-
-                if window_cf_dictionary_ref.is_null() {
-                    continue;
-                }
-
-                let k_cg_window_number =
-                    get_cf_number_u32_value(window_cf_dictionary_ref, "kCGWindowNumber")?;
-
-                if k_cg_window_number == self.id {
-                    let window_name =
-                        match get_cf_string_value(window_cf_dictionary_ref, "kCGWindowName") {
-                            Ok(window_name) => window_name,
-                            _ => return Err(XCapError::new("Get window name failed")),
-                        };
-
-                    let window_owner_name =
-                        match get_cf_string_value(window_cf_dictionary_ref, "kCGWindowOwnerName") {
-                            Ok(window_owner_name) => window_owner_name,
-                            _ => return Err(XCapError::new("Get window owner name failed")),
-                        };
-
-                    let impl_window = ImplWindow::new(
-                        window_cf_dictionary_ref,
-                        &impl_monitors,
-                        window_name,
-                        window_owner_name,
-                    )?;
-
-                    self.id = impl_window.id;
-                    self.title = impl_window.title;
-                    self.app_name = impl_window.app_name;
-                    self.current_monitor = impl_window.current_monitor;
-                    self.x = impl_window.x;
-                    self.y = impl_window.y;
-                    self.width = impl_window.width;
-                    self.height = impl_window.height;
-                    self.is_minimized = impl_window.is_minimized;
-                    self.is_maximized = impl_window.is_maximized;
-                    self.is_focused = impl_window.is_focused;
-
-                    return Ok(());
-                }
-            }
-
-            Err(XCapError::new("Not Found window"))
-        }
-    }
     pub fn capture_image(&self) -> XCapResult<RgbaImage> {
         capture(
             CGRect::new(
-                &CGPoint::new(self.x as f64, self.y as f64),
-                &CGSize::new(self.width as f64, self.height as f64),
+                CGPoint::new(self.x as f64, self.y as f64),
+                CGSize::new(self.width as f64, self.height as f64),
             ),
-            kCGWindowListOptionIncludingWindow,
+            CGWindowListOption::OptionIncludingWindow,
             self.id,
         )
     }
